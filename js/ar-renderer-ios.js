@@ -17,7 +17,7 @@ function _isIOS() {
     (navigator.userAgent.includes('Mac') && 'ontouchend' in document);
 }
 
-/* ── Vertex shader ─────────────────────────────────────────────────────────── */
+/* ── Vertex shader (Android fallback) ──────────────────────────────────────── */
 const WATER_VERT = /* glsl */`
   uniform vec3 uCamPos;
 
@@ -34,12 +34,13 @@ const WATER_VERT = /* glsl */`
   }
 `;
 
-/* ── Fragment shader ───────────────────────────────────────────────────────── */
+/* ── Fragment shader (Android fallback — translucent teal) ─────────────────── */
 const WATER_FRAG = /* glsl */`
   precision highp float;
 
   uniform float uOpacity;
   uniform float uDepth;
+  uniform float uTime;
   uniform vec3  uCamPos;
 
   varying vec3  vWorldPos;
@@ -48,18 +49,69 @@ const WATER_FRAG = /* glsl */`
 
   void main() {
     float distFactor = smoothstep(0.3, 3.5, vDist);
-    float depthScale = clamp(uDepth * 1.5 + 0.60, 0.60, 1.0);
+    vec2  edgeDist = min(vUV, 1.0 - vUV);
+    float edgeFade = smoothstep(0.0, 0.08, edgeDist.x) * smoothstep(0.0, 0.08, edgeDist.y);
+    float ripple   = sin(vUV.x * 18.0 + uTime * 1.8) * cos(vUV.y * 14.0 + uTime * 1.2);
+    ripple = ripple * 0.5 + 0.5;
+    vec3  col   = vec3(0.18, 0.68, 0.88) + vec3(0.06, 0.08, 0.04) * ripple;
+    float alpha = (mix(0.08, 0.22, distFactor) + ripple * 0.04) * edgeFade * uOpacity;
+    gl_FragColor = vec4(col, clamp(alpha, 0.0, 0.30));
+  }
+`;
 
-    vec2  edgeDist  = min(vUV, 1.0 - vUV);
-    float edgeFade  = smoothstep(0.0, 0.08, edgeDist.x)
-                    * smoothstep(0.0, 0.08, edgeDist.y);
+/* ── iOS vertex shader — also outputs clip-space pos for screen UV ─────────── */
+const WATER_VERT_IOS = /* glsl */`
+  uniform vec3 uCamPos;
 
-    vec3 col = vec3(0.25, 0.65, 1.00);
+  varying vec4  vClipPos;
+  varying float vDist;
+  varying vec2  vUV;
 
-    float alpha = mix(0.22, 0.62, distFactor) * depthScale * edgeFade * uOpacity;
-    alpha = clamp(alpha, 0.0, 0.70);
+  void main() {
+    vec4 worldPos = modelMatrix * vec4(position, 1.0);
+    vDist    = length(worldPos.xz - uCamPos.xz);
+    vUV      = uv;
+    vec4 clip = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    vClipPos  = clip;
+    gl_Position = clip;
+  }
+`;
 
-    gl_FragColor = vec4(col, alpha);
+/* ── iOS fragment shader — reflective camera-feed surface with wave distortion */
+const WATER_FRAG_IOS = /* glsl */`
+  precision highp float;
+
+  uniform sampler2D uCameraFeed;
+  uniform float     uOpacity;
+  uniform float     uTime;
+
+  varying vec4  vClipPos;
+  varying float vDist;
+  varying vec2  vUV;
+
+  void main() {
+    // Screen-space UV of this fragment
+    vec2 screenUV = vClipPos.xy / vClipPos.w * 0.5 + 0.5;
+
+    // Two overlapping wave patterns for organic surface distortion
+    float w1 = sin(vUV.x * 18.0 + uTime * 2.2) * cos(vUV.y * 12.0 + uTime * 1.6);
+    float w2 = sin(vUV.x * 8.0  - uTime * 1.4) * cos(vUV.y * 22.0 + uTime * 2.0);
+    vec2 distort = vec2(w1 + w2 * 0.5, w2 + w1 * 0.3) * 0.028;
+
+    // Flip Y to get the reflection of what's above the water plane
+    vec2 reflectUV = clamp(vec2(screenUV.x + distort.x, 1.0 - screenUV.y + distort.y), 0.0, 1.0);
+    vec3 reflection = texture2D(uCameraFeed, reflectUV).rgb;
+
+    // Darken and tint — floodwater is murky, not clear blue
+    vec3 waterColor = mix(reflection * 0.60, vec3(0.04, 0.07, 0.10), 0.38);
+
+    // Fade at edges and very close to camera feet
+    vec2  edgeDist = min(vUV, 1.0 - vUV);
+    float edgeFade = smoothstep(0.0, 0.10, edgeDist.x) * smoothstep(0.0, 0.10, edgeDist.y);
+    float distFade = smoothstep(0.2, 1.2, vDist);
+
+    float alpha = edgeFade * distFade * uOpacity;
+    gl_FragColor = vec4(waterColor, clamp(alpha, 0.0, 0.92));
   }
 `;
 
@@ -273,7 +325,10 @@ export class ARRenderer {
 
     // Camera is fixed at world origin (0,0,0); ground is 1.6 m below
     const camPos = new THREE.Vector3(0, 0, 0);
-    if (this._waterMat) this._waterMat.uniforms.uCamPos.value.copy(camPos);
+    if (this._waterMat) {
+      this._waterMat.uniforms.uCamPos.value.copy(camPos);
+      this._waterMat.uniforms.uTime.value = this._clock.getElapsedTime();
+    }
 
     // Horizontal forward direction from camera orientation
     const camDir = new THREE.Vector3(0, 0, -1);
@@ -314,7 +369,10 @@ export class ARRenderer {
     const camPos = new THREE.Vector3();
     xrCam.getWorldPosition(camPos);
 
-    if (this._waterMat) this._waterMat.uniforms.uCamPos.value.copy(camPos);
+    if (this._waterMat) {
+      this._waterMat.uniforms.uCamPos.value.copy(camPos);
+      this._waterMat.uniforms.uTime.value = this._clock.getElapsedTime();
+    }
 
     const camDir = new THREE.Vector3();
     xrCam.getWorldDirection(camDir);
@@ -397,18 +455,43 @@ export class ARRenderer {
     const geo = new THREE.PlaneGeometry(8, 8, 1, 1);
     geo.rotateX(-Math.PI / 2);
 
-    this._waterMat = new THREE.ShaderMaterial({
-      uniforms: {
-        uOpacity: { value: 0 },
-        uDepth:   { value: 0 },
-        uCamPos:  { value: new THREE.Vector3() },
-      },
-      vertexShader:   WATER_VERT,
-      fragmentShader: WATER_FRAG,
-      transparent: true,
-      depthWrite:  false,
-      side: THREE.DoubleSide,
-    });
+    if (this._iosMode) {
+      // iOS: reflective surface — samples the camera video feed as a reflection texture
+      const videoEl = document.getElementById('camera-feed');
+      this._cameraTexture = new THREE.VideoTexture(videoEl);
+      this._cameraTexture.minFilter = THREE.LinearFilter;
+      this._cameraTexture.magFilter = THREE.LinearFilter;
+
+      this._waterMat = new THREE.ShaderMaterial({
+        uniforms: {
+          uOpacity:    { value: 0 },
+          uDepth:      { value: 0 },
+          uTime:       { value: 0 },
+          uCamPos:     { value: new THREE.Vector3() },
+          uCameraFeed: { value: this._cameraTexture },
+        },
+        vertexShader:   WATER_VERT_IOS,
+        fragmentShader: WATER_FRAG_IOS,
+        transparent: true,
+        depthWrite:  false,
+        side: THREE.DoubleSide,
+      });
+    } else {
+      // Android WebXR: translucent teal fallback (no video texture access)
+      this._waterMat = new THREE.ShaderMaterial({
+        uniforms: {
+          uOpacity: { value: 0 },
+          uDepth:   { value: 0 },
+          uTime:    { value: 0 },
+          uCamPos:  { value: new THREE.Vector3() },
+        },
+        vertexShader:   WATER_VERT,
+        fragmentShader: WATER_FRAG,
+        transparent: true,
+        depthWrite:  false,
+        side: THREE.DoubleSide,
+      });
+    }
 
     this._waterPlane = new THREE.Mesh(geo, this._waterMat);
     this._waterPlane.visible = false;
